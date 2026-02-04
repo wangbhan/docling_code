@@ -1,0 +1,13 @@
+.idea
+
+models
+
+demo_models
+
+*.docx
+
+*.md
+
+*.html
+
+docling_demo/output
