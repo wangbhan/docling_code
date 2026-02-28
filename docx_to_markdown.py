@@ -13,7 +13,13 @@ DOCX 转 Markdown 脚本
 
 import os
 import re
-from typing import Optional
+from pathlib import Path
+from typing import List, Optional
+
+import pymysql
+from llama_index.core import Document
+from llama_index.core.node_parser import MarkdownNodeParser
+from llama_index.core.schema import TextNode
 
 import numpy as np
 from PIL import Image
@@ -55,6 +61,12 @@ class DocxToMarkdownConverter:
         # 创建 DocumentConverter 和 OCR 引擎
         self.converter = self._create_converter()
         self.ocr_engine = self._create_ocr_engine()
+
+        # 创建 MarkdownNodeParser 用于切片
+        self.node_parser = MarkdownNodeParser(
+            include_metadata=True,
+            include_prev_next_rel=True,
+        )
 
     def _get_model_paths(self, use_mobile_model: bool) -> tuple[str, str, str]:
         """获取 OCR 模型路径"""
@@ -293,6 +305,207 @@ class DocxToMarkdownConverter:
 
         return markdown_content
 
+    def chunk_markdown(
+        self,
+        markdown_content: str,
+        source_path: Optional[str] = None,
+        extra_metadata: Optional[dict] = None,
+    ) -> List[TextNode]:
+        """
+        对 Markdown 内容进行结构化切片
+
+        Args:
+            markdown_content: Markdown 内容字符串
+            source_path: 源文件路径（用于元数据）
+            extra_metadata: 额外的元数据
+
+        Returns:
+            TextNode 列表，每个节点包含：
+            - text: 切片文本
+            - metadata: 包含 header_path、file_path、file_name 等信息
+        """
+        # 构建元数据
+        metadata = {}
+        if source_path:
+            path = Path(source_path)
+            metadata["file_path"] = str(path)
+            metadata["file_name"] = path.name
+        if extra_metadata:
+            metadata.update(extra_metadata)
+
+        # 创建 LlamaIndex Document
+        document = Document(text=markdown_content, metadata=metadata)
+
+        # 使用 MarkdownNodeParser 进行切片
+        nodes = self.node_parser.get_nodes_from_documents([document])
+
+        return nodes
+
+    def convert_and_chunk(
+        self,
+        docx_path: str,
+        output_path: Optional[str] = None,
+        raise_on_ocr_error: bool = True,
+        extra_metadata: Optional[dict] = None,
+    ) -> tuple[str, List[TextNode]]:
+        """
+        转换 DOCX 文档为 Markdown 并进行结构化切片
+
+        Args:
+            docx_path: DOCX 文档路径
+            output_path: 输出 Markdown 文件路径（可选）
+            raise_on_ocr_error: OCR 失败时是否抛出错误
+            extra_metadata: 额外的元数据
+
+        Returns:
+            (markdown_content, nodes) 元组：
+            - markdown_content: Markdown 内容字符串
+            - nodes: TextNode 列表
+        """
+        # 1. 转换为 Markdown
+        markdown_content = self.convert(
+            docx_path=docx_path,
+            output_path=output_path,
+            raise_on_ocr_error=raise_on_ocr_error,
+        )
+
+        # 2. 进行切片
+        print("正在进行 Markdown 切片...")
+        nodes = self.chunk_markdown(
+            markdown_content=markdown_content,
+            source_path=docx_path,
+            extra_metadata=extra_metadata,
+        )
+        print(f"切片完成，共 {len(nodes)} 个切片")
+
+        return markdown_content, nodes
+
+    def save_chunks_to_txt(
+        self,
+        nodes: List[TextNode],
+        output_path: str,
+        separator: str = "\n" + "=" * 50 + "\n",
+    ) -> None:
+        """
+        将切片内容保存为 TXT 文件
+
+        Args:
+            nodes: TextNode 列表
+            output_path: 输出 TXT 文件路径
+            separator: 切片之间的分隔符
+        """
+        output_dir = os.path.dirname(output_path)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            for i, node in enumerate(nodes):
+                header_path = node.metadata.get("header_path", "无标题路径")
+                file_name = node.metadata.get("file_name", "未知")
+                text_length = len(node.text)
+
+                # 写入切片头信息
+                f.write(f"=== Chunk {i + 1} ===\n")
+                f.write(f"标题路径: {header_path}\n")
+                f.write(f"文件来源: {file_name}\n")
+                f.write(f"文本长度: {text_length} 字符\n\n")
+
+                # 写入切片内容
+                f.write(node.text)
+
+                # 写入分隔符（最后一个切片不加）
+                if i < len(nodes) - 1:
+                    f.write(separator)
+
+        print(f"切片内容已保存到: {output_path}")
+
+    def save_chunks_to_mysql(
+        self,
+        nodes: List[TextNode],
+        host: str = "localhost",
+        port: int = 3306,
+        user: str = "root",
+        password: str = "",
+        database: str = "docling_demo",
+        table: str = "document_chunks",
+        create_table: bool = True,
+    ) -> int:
+        """
+        将切片保存到 MySQL 数据库
+
+        Args:
+            nodes: TextNode 列表
+            host: MySQL 主机地址
+            port: MySQL 端口
+            user: MySQL 用户名
+            password: MySQL 密码
+            database: 数据库名
+            table: 表名
+            create_table: 是否自动创建表
+
+        Returns:
+            插入的记录数
+        """
+        # 连接数据库
+        connection = pymysql.connect(
+            host=host,
+            port=port,
+            user=user,
+            password=password,
+            database=database,
+            charset="utf8mb4",
+            cursorclass=pymysql.cursors.DictCursor,
+        )
+
+        try:
+            with connection.cursor() as cursor:
+                # 创建表（如果需要）
+                if create_table:
+                    create_sql = f"""
+                    CREATE TABLE IF NOT EXISTS {table} (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        chunk_index INT NOT NULL COMMENT '切片序号',
+                        header_path VARCHAR(500) COMMENT '标题路径',
+                        file_path VARCHAR(500) COMMENT '源文件路径',
+                        file_name VARCHAR(255) COMMENT '源文件名',
+                        content LONGTEXT NOT NULL COMMENT '切片内容（含base64图片）',
+                        content_length INT COMMENT '内容长度',
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        INDEX idx_file_name (file_name),
+                        INDEX idx_header_path (header_path(100))
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+                    """
+                    cursor.execute(create_sql)
+
+                # 插入数据
+                insert_sql = f"""
+                INSERT INTO {table} (chunk_index, header_path, file_path, file_name, content, content_length)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """
+
+                for i, node in enumerate(nodes):
+                    header_path = node.metadata.get("header_path", "")
+                    file_path = node.metadata.get("file_path", "")
+                    file_name = node.metadata.get("file_name", "")
+                    content = node.text
+                    content_length = len(content)
+
+                    cursor.execute(insert_sql, (
+                        i + 1,
+                        header_path,
+                        file_path,
+                        file_name,
+                        content,
+                        content_length,
+                    ))
+
+                connection.commit()
+                print(f"已将 {len(nodes)} 个切片保存到 MySQL 表 {database}.{table}")
+                return len(nodes)
+
+        finally:
+            connection.close()
+
 
 def main():
     """主函数示例"""
@@ -303,16 +516,46 @@ def main():
         use_mobile_model=True,
     )
 
-    # 转换文档
+    # 转换文档并切片
     try:
-        markdown_content = converter.convert(
-            docx_path="./demo4.docx",  # 输入 DOCX 文件
+        markdown_content, nodes = converter.convert_and_chunk(
+            docx_path="./demo1.docx",  # 输入 DOCX 文件
             output_path="./docx_output.md",  # 输出 Markdown 文件
-            raise_on_ocr_error=True,
+            raise_on_ocr_error=False,
         )
 
         print("\n转换成功！")
         print(f"Markdown 内容长度: {len(markdown_content)} 字符")
+        print(f"切片数量: {len(nodes)}")
+
+        # 保存切片内容到 TXT 文件
+        converter.save_chunks_to_txt(
+            nodes=nodes,
+            output_path="./docx_chunks.txt",
+        )
+
+        # 保存切片到 MySQL（需要先创建数据库）
+        # converter.save_chunks_to_mysql(
+        #     nodes=nodes,
+        #     host="localhost",
+        #     port=3306,
+        #     user="root",
+        #     password="your_password",
+        #     database="docling_demo",
+        #     table="document_chunks",
+        # )
+
+        # 打印切片信息
+        print("\n" + "=" * 50)
+        print("切片详情：")
+        for i, node in enumerate(nodes):
+            header_path = node.metadata.get("header_path", "无标题路径")
+            text_preview = node.text[:100].replace("\n", " ")
+            if len(node.text) > 100:
+                text_preview += "..."
+            print(f"\n--- Chunk {i + 1} ---")
+            print(f"标题路径: {header_path}")
+            print(f"内容预览: {text_preview}")
 
     except FileNotFoundError as e:
         print(f"错误：{e}")

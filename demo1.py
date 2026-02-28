@@ -48,7 +48,7 @@ converter = DocumentConverter(
 reader = DoclingReader(doc_converter=converter)
 
 # 加载文档
-documents = reader.load_data("../demo4.pdf")
+documents = reader.load_data("./demo1.pdf")
 print(documents)
 
 print(documents[0].text_resource.text)
